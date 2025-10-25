@@ -1,0 +1,5 @@
+{
+  "name": "Small mobile strike",
+  "description": "A low-resolution first-person shooter game built with React and HTML Canvas, designed to run smoothly on low-end devices. It uses a classic raycasting engine for a retro aesthetic and can be installed as a Progressive Web App (PWA) on supported devices like Android for an app-like, offline experience.",
+  "requestFramePermissions": []
+}

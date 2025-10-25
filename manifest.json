@@ -1,0 +1,22 @@
+{
+  "name": "Small mobile strike",
+  "short_name": "SMS Strike",
+  "description": "A low-resolution first-person shooter game for mobile and desktop.",
+  "start_url": ".",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/icon.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ]
+}
