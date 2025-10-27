@@ -15,6 +15,9 @@ import {
   FIRE_RATE,
   MELEE_RATE,
   RELOAD_TIME,
+  PLAYER_MAX_HEALTH,
+  PLAYER_RESPAWN_TIME,
+  SPAWN_IMMUNITY_DURATION,
   WEAPON_SWITCH_BUTTON_X,
   WEAPON_SWITCH_BUTTON_Y,
   WEAPON_SWITCH_BUTTON_WIDTH,
@@ -31,17 +34,25 @@ import {
   ENEMY_DETECTION_RANGE,
   ENEMY_DEATH_ANIM_DURATION,
   ENEMY_RESPAWN_TIME,
+  ENEMY_DAMAGE,
+  ENEMY_ATTACK_RATE,
+  ENEMY_ATTACK_RANGE,
   GUN_DAMAGE,
   KNIFE_DAMAGE,
   KNIFE_RANGE,
   SCORE_PER_KILL,
   LEADERBOARD_NAMES,
+  initialMedkits,
+  MEDKIT_HEAL_AMOUNT,
+  MEDKIT_RESPAWN_TIME,
+  MEDKIT_PICKUP_RANGE,
 } from '../constants';
 import * as audio from '../utils/audio';
 import type { Player, Sprite } from '../types';
 
 interface GameCanvasProps {
   onScoreChange: (score: number) => void;
+  isPaused: boolean;
 }
 
 // Helper to shuffle array
@@ -53,11 +64,14 @@ const shuffleArray = (array: any[]) => {
   return array;
 };
 
-const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
+// Easing function for smooth animation
+const easeInOutQuad = (t: number) => t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+
+const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange, isPaused }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playerRef = useRef<Player>({
-    posX: 22,
-    posY: 12,
+    posX: 10.5,
+    posY: 10.5,
     dirX: -1,
     dirY: 0,
     planeX: 0,
@@ -66,22 +80,40 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     maxAmmo: MAX_AMMO,
     score: 0,
     weapon: 'gun',
+    health: PLAYER_MAX_HEALTH,
+    maxHealth: PLAYER_MAX_HEALTH,
+    isImmune: true,
+    immunityTimer: SPAWN_IMMUNITY_DURATION,
   });
-  const spritesRef = useRef<Sprite[]>(
-    initialSprites.map((s, i) => {
-      const shuffledNames = shuffleArray([...LEADERBOARD_NAMES]);
-      return {
-        ...s,
-        initialX: s.x,
-        initialY: s.y,
-        health: ENEMY_HEALTH,
-        state: 'idle',
-        deathTimer: 0,
-        respawnTimer: 0,
-        name: shuffledNames[i % shuffledNames.length],
-      }
-    })
-  );
+
+  const initializeSprites = () => {
+    const shuffledNames = shuffleArray([...LEADERBOARD_NAMES]);
+    const enemySprites: Sprite[] = initialSprites.map((s, i) => ({
+      type: 'enemy',
+      ...s,
+      initialX: s.x,
+      initialY: s.y,
+      health: ENEMY_HEALTH,
+      state: 'idle',
+      deathTimer: 0,
+      respawnTimer: 0,
+      name: shuffledNames[i % shuffledNames.length],
+      attackCooldown: 0,
+    }));
+
+    const medkitSprites: Sprite[] = initialMedkits.map(s => ({
+      type: 'medkit',
+      ...s,
+      initialX: s.x,
+      initialY: s.y,
+      state: 'idle',
+      respawnTimer: 0,
+    }));
+    
+    return [...enemySprites, ...medkitSprites];
+  }
+  
+  const spritesRef = useRef<Sprite[]>(initializeSprites());
   const keysPressed = useRef<{ [key: string]: boolean }>({});
   const gameLoopRef = useRef<number | null>(null);
 
@@ -96,6 +128,21 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
   const reloadTimer = useRef<number>(0);
   const zBuffer = useRef<number[]>(new Array(SCREEN_WIDTH).fill(0));
   const hasInteracted = useRef<boolean>(false);
+  const recoilOffset = useRef<number>(0);
+  const playerStateRef = useRef<'alive' | 'dead'>('alive');
+  const playerRespawnTimer = useRef<number>(0);
+  const damageFlashTimer = useRef<number>(0);
+  const emptyClickCooldown = useRef<number>(0);
+  const emptyGunAnimTimer = useRef<number>(0);
+  const ammoFlashTimer = useRef<number>(0);
+
+
+  // Weapon switch state
+  const isSwitchingWeapon = useRef<boolean>(false);
+  const weaponSwitchTimer = useRef<number>(0);
+  const previousWeapon = useRef<'gun' | 'knife'>('gun');
+  const WEAPON_SWITCH_DURATION = 20; // frames, ~0.33s at 60fps
+
 
   // Touch state refs
   const leftTouchId = useRef<number | null>(null);
@@ -106,6 +153,17 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
   const lookStart = useRef<{ x: number; y: number } | null>(null);
   const lookDeltaX = useRef<number>(0);
   
+  const handleWeaponSwitch = useCallback((newWeapon: 'gun' | 'knife') => {
+    const player = playerRef.current;
+    if (isSwitchingWeapon.current || player.weapon === newWeapon) return;
+
+    isSwitchingWeapon.current = true;
+    weaponSwitchTimer.current = WEAPON_SWITCH_DURATION;
+    previousWeapon.current = player.weapon;
+    player.weapon = newWeapon;
+    audio.playWeaponSwitch();
+  }, []);
+
   const drawHud = (ctx: CanvasRenderingContext2D, player: Player) => {
     ctx.font = '16px "Courier New", Courier, monospace';
     ctx.fillStyle = 'white';
@@ -115,6 +173,20 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     const scoreText = `SCORE: ${String(player.score).padStart(6, '0')}`;
     ctx.fillText(scoreText, 10, 20);
     
+    // Health
+    ctx.fillStyle = 'red';
+    ctx.fillRect(10, SCREEN_HEIGHT - 25, 100, 15);
+    const healthPercentage = player.health / player.maxHealth;
+    ctx.fillStyle = 'green';
+    ctx.fillRect(10, SCREEN_HEIGHT - 25, 100 * healthPercentage, 15);
+    ctx.strokeStyle = 'white';
+    ctx.strokeRect(10, SCREEN_HEIGHT - 25, 100, 15);
+    ctx.fillStyle = 'white';
+    ctx.font = '12px "Courier New", Courier, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${player.health}/${player.maxHealth}`, 60, SCREEN_HEIGHT - 17);
+
     // Crosshair / Reloading indicator
     if (isReloading.current) {
         ctx.font = '20px "Courier New", Courier, monospace';
@@ -128,71 +200,135 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
       const gap = 3;
       ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
       // top
-      ctx.fillRect(centerX - 1, centerY - gap - size, 2, size);
+      ctx.fillRect(centerX - 1, centerY - gap - size + recoilOffset.current / 2, 2, size);
       // bottom
-      ctx.fillRect(centerX - 1, centerY + gap, 2, size);
+      ctx.fillRect(centerX - 1, centerY + gap + recoilOffset.current / 2, 2, size);
       // left
-      ctx.fillRect(centerX - gap - size, centerY - 1, size, 2);
+      ctx.fillRect(centerX - gap - size, centerY - 1 + recoilOffset.current / 2, size, 2);
       // right
-      ctx.fillRect(centerX + gap, centerY - 1, size, 2);
+      ctx.fillRect(centerX + gap, centerY - 1 + recoilOffset.current / 2, size, 2);
     }
     
     // Ammo - only if gun is equipped
     if (player.weapon === 'gun') {
       ctx.font = '16px "Courier New", Courier, monospace';
-      ctx.fillStyle = 'white';
+      
+      if (ammoFlashTimer.current > 0 && gameTick.current % 10 < 5) {
+        ctx.fillStyle = 'red';
+      } else {
+        ctx.fillStyle = 'white';
+      }
+      
       ctx.textAlign = 'right';
       const ammoText = `AMMO: ${player.ammo}/${player.maxAmmo}`;
       ctx.fillText(ammoText, SCREEN_WIDTH - 10, SCREEN_HEIGHT - 10);
+      ctx.fillStyle = 'white'; // Reset color
     }
   };
 
-  const drawGun = (ctx: CanvasRenderingContext2D) => {
-    const gunBob = isMoving.current ? Math.sin(gameTick.current * GUN_BOB_SPEED) * GUN_BOB_AMOUNT : 0;
-    const gunX = SCREEN_WIDTH / 2 - 20;
-    const gunY = SCREEN_HEIGHT - 60 + gunBob;
+  const drawGun = (ctx: CanvasRenderingContext2D, animationOffsetY: number = 0) => {
+    const moveBob = isMoving.current ? Math.sin(gameTick.current * GUN_BOB_SPEED) * GUN_BOB_AMOUNT : 0;
+    const idleBob = Math.sin(gameTick.current * (GUN_BOB_SPEED / 2)) * (GUN_BOB_AMOUNT / 3);
+    const totalBob = moveBob + idleBob;
+
+    let gunYOffset = isReloading.current ? 40 * Math.sin((reloadTimer.current / RELOAD_TIME) * Math.PI) : 0;
+    gunYOffset += recoilOffset.current;
+    
+    if (emptyGunAnimTimer.current > 0) {
+      const progress = 1 - (emptyGunAnimTimer.current / 10);
+      gunYOffset += Math.sin(progress * Math.PI) * -15; // Jerk up
+    }
+
+    const gunX = SCREEN_WIDTH / 2 - 25;
+    const gunY = SCREEN_HEIGHT - 70 + totalBob + gunYOffset + animationOffsetY;
     
     // Gun body
-    ctx.fillStyle = '#4a4a4a';
-    ctx.fillRect(gunX, gunY, 40, 20); // main body
-    ctx.fillStyle = '#3a3a3a';
-    ctx.fillRect(gunX + 15, gunY + 20, 10, 15); // handle
+    ctx.fillStyle = '#3a3a3a'; // Darker grey
+    ctx.fillRect(gunX, gunY + 5, 50, 10); // Slide
+    ctx.fillStyle = '#4a4a4a'; // Main grey
+    ctx.fillRect(gunX, gunY + 15, 50, 15); // Frame
+    
+    // Grip
+    ctx.fillStyle = '#2a2a2a'; // Even darker
+    ctx.fillRect(gunX + 10, gunY + 30, 15, 25);
     
     // Barrel
     ctx.fillStyle = '#5a5a5a';
-    ctx.fillRect(gunX, gunY - 10, 8, 10);
+    ctx.fillRect(gunX - 5, gunY, 10, 5);
 
     // Muzzle flash
     if (shootAnimTimer.current > 0) {
         ctx.fillStyle = 'yellow';
         ctx.beginPath();
-        ctx.moveTo(gunX + 4, gunY - 10);
-        ctx.lineTo(gunX - 5, gunY - 25);
-        ctx.lineTo(gunX + 13, gunY - 25);
+        ctx.moveTo(gunX, gunY);
+        ctx.lineTo(gunX - 10, gunY - 15);
+        ctx.lineTo(gunX + 10, gunY - 15);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = 'orange';
+        ctx.beginPath();
+        ctx.moveTo(gunX, gunY);
+        ctx.lineTo(gunX - 5, gunY - 10);
+        ctx.lineTo(gunX + 5, gunY - 10);
         ctx.closePath();
         ctx.fill();
     }
   };
 
-  const drawKnife = (ctx: CanvasRenderingContext2D) => {
-    const gunBob = isMoving.current ? Math.sin(gameTick.current * GUN_BOB_SPEED) * GUN_BOB_AMOUNT : 0;
-    const slashOffset = slashAnimTimer.current > 0 ? 20 : 0;
-    const knifeX = SCREEN_WIDTH / 2 + 40 - slashOffset;
-    const knifeY = SCREEN_HEIGHT - 60 + gunBob;
+  const drawKnife = (ctx: CanvasRenderingContext2D, animationOffsetY: number = 0) => {
+    const moveBob = isMoving.current ? Math.sin(gameTick.current * GUN_BOB_SPEED) * GUN_BOB_AMOUNT : 0;
+    const idleBob = Math.sin(gameTick.current * (GUN_BOB_SPEED / 2)) * (GUN_BOB_AMOUNT / 3);
+    const totalBob = moveBob + idleBob;
+    
+    const slashProgress = slashAnimTimer.current > 0 ? 1 - (slashAnimTimer.current / (MELEE_RATE / 4)) : 0;
+    const slashAngle = Math.sin(slashProgress * Math.PI) * -0.8; // Radians for rotation
+    const slashX = Math.sin(slashProgress * Math.PI) * -30;
+    const slashY = Math.sin(slashProgress * Math.PI) * 10;
+    
+    const knifeX = SCREEN_WIDTH / 2 + 50 + slashX;
+    const knifeY = SCREEN_HEIGHT - 60 + totalBob + slashY + animationOffsetY;
+    
+    ctx.save();
+    ctx.translate(knifeX, knifeY);
+    ctx.rotate(slashAngle);
 
     // Handle
     ctx.fillStyle = '#6b4f3a'; // Brown
-    ctx.fillRect(knifeX + 5, knifeY, 10, 25);
+    ctx.fillRect(0, 0, 10, 30);
+    // Guard
+    ctx.fillStyle = '#555';
+    ctx.fillRect(-5, 0, 20, 5);
 
     // Blade
     ctx.fillStyle = '#c0c0c0'; // Silver
     ctx.beginPath();
-    ctx.moveTo(knifeX, knifeY);
-    ctx.lineTo(knifeX + 20, knifeY - 20);
-    ctx.lineTo(knifeX + 25, knifeY - 15);
-    ctx.lineTo(knifeX + 5, knifeY + 5);
+    ctx.moveTo(5, 0);
+    ctx.lineTo(5, -40);
+    ctx.lineTo(10, -35);
+    ctx.lineTo(10, 0);
     ctx.closePath();
     ctx.fill();
+    
+    // Blade highlight
+    ctx.fillStyle = '#e0e0e0';
+    ctx.beginPath();
+    ctx.moveTo(5, 0);
+    ctx.lineTo(5, -40);
+    ctx.lineTo(7, -38);
+    ctx.lineTo(7, 0);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+    
+    // Slash swoosh effect
+    if (slashAnimTimer.current > 1) {
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.5 * slashProgress})`;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(SCREEN_WIDTH / 2 + 10, SCREEN_HEIGHT, 80, -Math.PI * 0.6, -Math.PI * 0.4);
+      ctx.stroke();
+    }
   };
 
   const renderGame = useCallback(() => {
@@ -207,9 +343,20 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     ctx.fillStyle = '#87CEFA'; // Light Sky Blue
     ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT / 2);
 
-    // Floor
-    ctx.fillStyle = '#348C31'; // Green
-    ctx.fillRect(0, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT / 2);
+    // Floor based on player's Y position
+    if (player.posY > 12.5) {
+      // Beach area
+      ctx.fillStyle = '#f0e68c'; // Khaki sand
+      ctx.fillRect(0, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT / 2);
+    } else if (player.posY > 7.5) {
+      // Street area
+      ctx.fillStyle = '#4b5563'; // Gray-600 for asphalt
+      ctx.fillRect(0, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT / 2);
+    } else {
+      // City/Park area
+      ctx.fillStyle = '#166534'; // Dark green for grass/dirt
+      ctx.fillRect(0, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT / 2);
+    }
     
     for (let x = 0; x < SCREEN_WIDTH; x++) {
       const cameraX = 2 * x / SCREEN_WIDTH - 1;
@@ -257,7 +404,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
           mapY += stepY;
           side = 1;
         }
-        if (worldMap[mapX][mapY] > 0) hit = 1;
+        if (worldMap[mapY][mapX] > 0) hit = 1;
       }
 
       if (side === 0) {
@@ -275,21 +422,26 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
       let drawEnd = lineHeight / 2 + SCREEN_HEIGHT / 2;
       if (drawEnd >= SCREEN_HEIGHT) drawEnd = SCREEN_HEIGHT - 1;
 
-      const wallType = worldMap[mapX][mapY];
+      const wallType = worldMap[mapY][mapX];
       let color;
       switch (wallType) {
-        case 1: color = '#ef4444'; break; // red-500
-        case 2: color = '#3b82f6'; break; // blue-500
-        case 3: color = '#22c55e'; break; // green-500
-        case 4: color = '#eab308'; break; // yellow-500
-        default: color = '#a855f7'; break; // purple-500
+        case 1: color = '#6b7280'; break; // Border (gray-500)
+        case 2: color = '#713f12'; break; // Concrete (brown-800)
+        case 3: color = '#166534'; break; // Old Park Wall (green-800)
+        case 4: color = '#f59e0b'; break; // Sand Dune (amber-500)
+        case 5: color = '#b91c1c'; break; // Brick (red-700)
+        case 6: color = '#7dd3fc'; break; // Window (sky-300)
+        case 7: color = '#a16207'; break; // Wood Pier (yellow-700)
+        case 8: color = '#15803d'; break; // Bushes (green-700)
+        default: color = '#a855f7'; break; // Default (purple-500)
       }
 
-      if (side === 1) {
+      // Darken walls on Y-axis for a cheap lighting effect, but not windows
+      if (side === 1 && wallType !== 6) {
         const r = parseInt(color.slice(1, 3), 16) * 0.7;
         const g = parseInt(color.slice(3, 5), 16) * 0.7;
         const b = parseInt(color.slice(5, 7), 16) * 0.7;
-        color = `rgb(${r}, ${g}, ${b})`;
+        color = `rgb(${Math.floor(r)}, ${Math.floor(g)}, ${Math.floor(b)})`;
       }
 
       ctx.fillStyle = color;
@@ -308,7 +460,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     for (let i = 0; i < sprites.length; i++) {
         const s = sprites[spriteOrder[i]];
         if (s.state === 'dead') continue;
-        if (s.state === 'idle' && spriteDistance[spriteOrder[i]] > ENEMY_DETECTION_RANGE ** 2) continue;
+        if (s.type === 'enemy' && s.state === 'idle' && spriteDistance[spriteOrder[i]] > ENEMY_DETECTION_RANGE ** 2) continue;
 
         const spriteX = s.x - player.posX;
         const spriteY = s.y - player.posY;
@@ -336,18 +488,76 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
         
         for (let stripe = drawStartX; stripe < drawEndX; stripe++) {
             if (transformY < zBuffer.current[stripe]) {
-                if (s.state === 'dying') {
-                    const deathProgress = s.deathTimer / ENEMY_DEATH_ANIM_DURATION;
-                    ctx.fillStyle = `rgba(255, 0, 0, ${1 - deathProgress})`;
-                } else {
-                    ctx.fillStyle = '#008000'; // Green
+                if (s.type === 'enemy') {
+                    if (s.state === 'dying') {
+                        const deathProgress = 1 - (s.deathTimer! / ENEMY_DEATH_ANIM_DURATION);
+                        const fallAmount = deathProgress * spriteHeight;
+                        const fadeAmount = 1 - deathProgress;
+
+                        // Draw collapsing pixels
+                        const headHeight = Math.floor(spriteHeight * 0.3);
+                        const headFall = fallAmount * 1.5;
+                        ctx.fillStyle = `rgba(210, 180, 140, ${fadeAmount})`; // Fading tan
+                        ctx.fillRect(stripe, drawStartY + headFall, 1, headHeight);
+                        
+                        const torsoHeight = spriteHeight * 0.5;
+                        const torsoFall = fallAmount;
+                        ctx.fillStyle = `rgba(0, 100, 0, ${fadeAmount})`; // Fading dark green
+                        ctx.fillRect(stripe, drawStartY + headHeight + torsoFall, 1, torsoHeight);
+
+                    } else {
+                        const bob = s.state === 'chasing' 
+                            ? Math.sin(gameTick.current * 0.2) * 2
+                            : Math.sin(gameTick.current * 0.05) * 1;
+                        
+                        const headHeight = Math.floor(spriteHeight * 0.3);
+                        const torsoHeight = Math.floor(spriteHeight * 0.5);
+                        const legsHeight = spriteHeight - headHeight - torsoHeight;
+
+                        const headStartY = drawStartY + bob;
+                        const torsoStartY = drawStartY + headHeight + bob;
+                        const legsStartY = drawStartY + headHeight + torsoHeight;
+
+                        // Draw head (tan)
+                        ctx.fillStyle = '#D2B48C';
+                        ctx.fillRect(stripe, headStartY, 1, headHeight);
+
+                        // Draw torso (dark green shirt)
+                        ctx.fillStyle = '#006400';
+                        ctx.fillRect(stripe, torsoStartY, 1, torsoHeight);
+
+                        // Draw legs (dark blue pants)
+                        ctx.fillStyle = '#00008B';
+                        ctx.fillRect(stripe, legsStartY, 1, legsHeight);
+                    }
+                } else if (s.type === 'medkit' && s.state === 'idle') {
+                    const boxHeight = Math.floor(spriteHeight * 0.6);
+                    const boxStartY = drawStartY + spriteHeight * 0.2;
+                    const crossThickness = Math.max(1, Math.floor(spriteWidth * 0.2));
+                    
+                    const stripeRelativeX = stripe - drawStartX;
+
+                    const isVerticalBar = stripeRelativeX > (spriteWidth / 2 - crossThickness / 2) && 
+                                            stripeRelativeX < (spriteWidth / 2 + crossThickness / 2);
+
+                    // draw green box bg
+                    ctx.fillStyle = '#22c55e';
+                    ctx.fillRect(stripe, boxStartY, 1, boxHeight);
+                    
+                    // draw cross
+                    ctx.fillStyle = 'white';
+                    if (isVerticalBar) {
+                        ctx.fillRect(stripe, boxStartY, 1, boxHeight);
+                    } else {
+                        const horizontalBarY = boxStartY + boxHeight / 2 - crossThickness / 2;
+                        ctx.fillRect(stripe, horizontalBarY, 1, crossThickness);
+                    }
                 }
-                ctx.fillRect(stripe, drawStartY, 1, spriteHeight);
             }
         }
         
-        // Draw sprite UI (health bar and name)
-        if (transformY > 0 && s.state !== 'dying' && transformY < zBuffer.current[Math.floor(spriteScreenX)] ) {
+        // Draw sprite UI (health bar and name for enemies)
+        if (s.type === 'enemy' && transformY > 0 && s.state !== 'dying' && transformY < zBuffer.current[Math.floor(spriteScreenX)] ) {
           const healthBarWidth = 30;
           const healthBarHeight = 4;
           const healthBarX = spriteScreenX - healthBarWidth / 2;
@@ -358,7 +568,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
           ctx.fillRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
 
           // Current health
-          const currentHealthPercentage = Math.max(0, s.health / ENEMY_HEALTH);
+          const currentHealthPercentage = Math.max(0, s.health! / ENEMY_HEALTH);
           const currentHealthWidth = healthBarWidth * currentHealthPercentage;
           ctx.fillStyle = '#00ff00';
           ctx.fillRect(healthBarX, healthBarY, currentHealthWidth, healthBarHeight);
@@ -372,7 +582,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
           ctx.fillStyle = 'white';
           ctx.font = '10px "Courier New"';
           ctx.textAlign = 'center';
-          ctx.fillText(s.name.toUpperCase(), spriteScreenX, drawStartY - 5);
+          ctx.fillText(s.name!.toUpperCase(), spriteScreenX, drawStartY - 5);
         }
     }
     
@@ -426,25 +636,96 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('SHOOT', SHOOT_BUTTON_X, SHOOT_BUTTON_Y);
+    
+    const isDead = playerStateRef.current === 'dead';
+
+    // Damage Flash (only when alive)
+    if (!isDead && damageFlashTimer.current > 0) {
+        const alpha = (damageFlashTimer.current / 10) * 0.5;
+        ctx.fillStyle = `rgba(255, 0, 0, ${alpha})`;
+        ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
+
+    // Spawn Immunity Flash (only when alive)
+    if (!isDead && player.isImmune && gameTick.current % 20 < 10) {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(2, 2, SCREEN_WIDTH - 4, SCREEN_HEIGHT - 4);
+    }
+
+    // Death Screen (if dead)
+    if (isDead) {
+        ctx.fillStyle = 'rgba(150, 0, 0, 0.5)';
+        ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        ctx.font = '40px "Courier New", Courier, monospace';
+        ctx.fillStyle = 'white';
+        ctx.textAlign = 'center';
+        ctx.fillText('YOU DIED', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 20);
+        const respawnSeconds = Math.ceil(playerRespawnTimer.current / 60);
+        ctx.font = '20px "Courier New", Courier, monospace';
+        ctx.fillText(`Respawning in ${respawnSeconds}...`, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20);
+        return; // Don't draw weapons or HUD
+    }
 
 
-    if (player.weapon === 'gun') {
-        drawGun(ctx);
+    // --- Draw Weapon ---
+    if (isSwitchingWeapon.current) {
+        const progress = 1 - (weaponSwitchTimer.current / WEAPON_SWITCH_DURATION);
+        const easedProgress = easeInOutQuad(progress);
+        const yOffset = 100; // How far the weapon moves down
+
+        const outY = easedProgress * yOffset;
+        const inY = (1 - easedProgress) * yOffset;
+
+        // Draw outgoing weapon
+        if (previousWeapon.current === 'gun') {
+            drawGun(ctx, outY);
+        } else {
+            drawKnife(ctx, outY);
+        }
+
+        // Draw incoming weapon
+        if (player.weapon === 'gun') {
+            drawGun(ctx, inY);
+        } else {
+            drawKnife(ctx, inY);
+        }
     } else {
-        drawKnife(ctx);
+        if (player.weapon === 'gun') {
+            drawGun(ctx);
+        } else {
+            drawKnife(ctx);
+        }
     }
     drawHud(ctx, player);
 
   }, []);
   
+  const respawnPlayer = useCallback(() => {
+    const player = playerRef.current;
+    player.posX = 10.5;
+    player.posY = 10.5;
+    player.dirX = -1;
+    player.dirY = 0;
+    player.planeX = 0;
+    player.planeY = 0.66;
+    player.health = PLAYER_MAX_HEALTH;
+    player.ammo = MAX_AMMO;
+    player.isImmune = true;
+    player.immunityTimer = SPAWN_IMMUNITY_DURATION;
+    playerStateRef.current = 'alive';
+  }, []);
+
   const updateSprites = useCallback(() => {
     const player = playerRef.current;
     
     spritesRef.current.forEach((sprite) => {
+      if (sprite.type === 'enemy' && sprite.attackCooldown! > 0) sprite.attackCooldown!--;
+      
       switch (sprite.state) {
         case 'dying':
-          sprite.deathTimer--;
-          if (sprite.deathTimer <= 0) {
+          sprite.deathTimer!--;
+          if (sprite.deathTimer! <= 0) {
             sprite.state = 'dead';
             sprite.respawnTimer = ENEMY_RESPAWN_TIME;
           }
@@ -453,28 +734,52 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
           sprite.respawnTimer--;
           if (sprite.respawnTimer <= 0) {
             sprite.state = 'idle';
-            sprite.health = ENEMY_HEALTH;
             sprite.x = sprite.initialX;
             sprite.y = sprite.initialY;
+            if (sprite.type === 'enemy') {
+                sprite.health = ENEMY_HEALTH;
+            } else if (sprite.type === 'medkit') {
+                sprite.respawnTimer = MEDKIT_RESPAWN_TIME;
+            }
           }
           break;
         case 'chasing':
         case 'idle':
-          const dist = Math.sqrt((player.posX - sprite.x)**2 + (player.posY - sprite.y)**2);
-          
-          if (dist < ENEMY_DETECTION_RANGE) {
-            sprite.state = 'chasing';
-          }
-          
-          if (sprite.state === 'chasing') {
-            const moveX = (player.posX - sprite.x) / dist * ENEMY_SPEED;
-            const moveY = (player.posY - sprite.y) / dist * ENEMY_SPEED;
+          if (sprite.type === 'enemy') {
+            const dist = Math.sqrt((player.posX - sprite.x)**2 + (player.posY - sprite.y)**2);
             
-            if(worldMap[Math.floor(sprite.x + moveX)][Math.floor(sprite.y)] === 0) {
-                sprite.x += moveX;
+            if (dist < ENEMY_DETECTION_RANGE && dist > 1) {
+              sprite.state = 'chasing';
+            } else {
+              sprite.state = 'idle';
             }
-            if(worldMap[Math.floor(sprite.x)][Math.floor(sprite.y + moveY)] === 0) {
-                sprite.y += moveY;
+            
+            if (sprite.state === 'chasing') {
+              const moveX = (player.posX - sprite.x) / dist * ENEMY_SPEED;
+              const moveY = (player.posY - sprite.y) / dist * ENEMY_SPEED;
+              
+              if(worldMap[Math.floor(sprite.y)][Math.floor(sprite.x + moveX)] === 0) {
+                  sprite.x += moveX;
+              }
+              if(worldMap[Math.floor(sprite.y + moveY)][Math.floor(sprite.x)] === 0) {
+                  sprite.y += moveY;
+              }
+               // ATTACK LOGIC
+              if (dist < ENEMY_ATTACK_RANGE && sprite.attackCooldown! <= 0 && playerStateRef.current === 'alive') {
+                  sprite.attackCooldown = ENEMY_ATTACK_RATE;
+                  if (!player.isImmune) {
+                      player.health -= ENEMY_DAMAGE;
+                      damageFlashTimer.current = 10;
+                      audio.playPlayerHit();
+
+                      if (player.health <= 0) {
+                          player.health = 0;
+                          playerStateRef.current = 'dead';
+                          playerRespawnTimer.current = PLAYER_RESPAWN_TIME;
+                          audio.playPlayerDeath();
+                      }
+                  }
+              }
             }
           }
           break;
@@ -489,11 +794,31 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     gameTick.current++;
     isMoving.current = false;
     
-    // Update cooldowns and animation timers
+    // Update timers
     if (shootCooldown.current > 0) shootCooldown.current--;
     if (slashCooldown.current > 0) slashCooldown.current--;
     if (shootAnimTimer.current > 0) shootAnimTimer.current--;
     if (slashAnimTimer.current > 0) slashAnimTimer.current--;
+    if (recoilOffset.current > 0) recoilOffset.current *= 0.7; // Dampen recoil
+    if (damageFlashTimer.current > 0) damageFlashTimer.current--;
+    if (emptyClickCooldown.current > 0) emptyClickCooldown.current--;
+    if (emptyGunAnimTimer.current > 0) emptyGunAnimTimer.current--;
+    if (ammoFlashTimer.current > 0) ammoFlashTimer.current--;
+
+    if (player.isImmune) {
+      player.immunityTimer--;
+      if (player.immunityTimer <= 0) {
+        player.isImmune = false;
+      }
+    }
+
+    // Update weapon switch timer
+    if (isSwitchingWeapon.current) {
+      weaponSwitchTimer.current--;
+      if (weaponSwitchTimer.current <= 0) {
+        isSwitchingWeapon.current = false;
+      }
+    }
 
     // Handle reloading
     if (isReloading.current) {
@@ -502,7 +827,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
         isReloading.current = false;
         player.ammo = player.maxAmmo;
       }
-    } else if (keys['r'] && player.weapon === 'gun' && player.ammo < player.maxAmmo && !isReloading.current) {
+    } else if (keys['r'] && player.weapon === 'gun' && player.ammo < player.maxAmmo && !isReloading.current && !isSwitchingWeapon.current) {
       isReloading.current = true;
       reloadTimer.current = RELOAD_TIME;
       audio.playReload();
@@ -513,37 +838,50 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
         isMoving.current = true;
     }
     if (keys['w']) {
-      if (worldMap[Math.floor(player.posX + player.dirX * MOVE_SPEED)][Math.floor(player.posY)] === 0) {
+      if (worldMap[Math.floor(player.posY)][Math.floor(player.posX + player.dirX * MOVE_SPEED)] === 0) {
         player.posX += player.dirX * MOVE_SPEED;
       }
-      if (worldMap[Math.floor(player.posX)][Math.floor(player.posY + player.dirY * MOVE_SPEED)] === 0) {
+      if (worldMap[Math.floor(player.posY + player.dirY * MOVE_SPEED)][Math.floor(player.posX)] === 0) {
         player.posY += player.dirY * MOVE_SPEED;
       }
     }
     if (keys['s']) {
-      if (worldMap[Math.floor(player.posX - player.dirX * MOVE_SPEED)][Math.floor(player.posY)] === 0) {
+      if (worldMap[Math.floor(player.posY)][Math.floor(player.posX - player.dirX * MOVE_SPEED)] === 0) {
         player.posX -= player.dirX * MOVE_SPEED;
       }
-      if (worldMap[Math.floor(player.posX)][Math.floor(player.posY - player.dirY * MOVE_SPEED)] === 0) {
+      if (worldMap[Math.floor(player.posY - player.dirY * MOVE_SPEED)][Math.floor(player.posX)] === 0) {
         player.posY -= player.dirY * MOVE_SPEED;
       }
     }
      if (keys['a']) {
-      if (worldMap[Math.floor(player.posX - player.planeX * MOVE_SPEED)][Math.floor(player.posY)] === 0) {
+      if (worldMap[Math.floor(player.posY)][Math.floor(player.posX - player.planeX * MOVE_SPEED)] === 0) {
         player.posX -= player.planeX * MOVE_SPEED;
       }
-      if (worldMap[Math.floor(player.posX)][Math.floor(player.posY - player.planeY * MOVE_SPEED)] === 0) {
+      if (worldMap[Math.floor(player.posY - player.planeY * MOVE_SPEED)][Math.floor(player.posX)] === 0) {
         player.posY -= player.planeY * MOVE_SPEED;
       }
     }
     if (keys['d']) {
-       if (worldMap[Math.floor(player.posX + player.planeX * MOVE_SPEED)][Math.floor(player.posY)] === 0) {
+       if (worldMap[Math.floor(player.posY)][Math.floor(player.posX + player.planeX * MOVE_SPEED)] === 0) {
         player.posX += player.planeX * MOVE_SPEED;
       }
-      if (worldMap[Math.floor(player.posX)][Math.floor(player.posY + player.planeY * MOVE_SPEED)] === 0) {
+      if (worldMap[Math.floor(player.posY + player.planeY * MOVE_SPEED)][Math.floor(player.posX)] === 0) {
         player.posY += player.planeY * MOVE_SPEED;
       }
     }
+
+    // Medkit pickup logic
+    spritesRef.current.forEach(sprite => {
+        if (sprite.type === 'medkit' && sprite.state === 'idle') {
+            const dist = Math.sqrt((player.posX - sprite.x)**2 + (player.posY - sprite.y)**2);
+            if (dist < MEDKIT_PICKUP_RANGE && player.health < player.maxHealth) {
+                sprite.state = 'dead';
+                sprite.respawnTimer = MEDKIT_RESPAWN_TIME;
+                player.health = Math.min(player.maxHealth, player.health + MEDKIT_HEAL_AMOUNT);
+                audio.playMedkitPickup();
+            }
+        }
+    });
 
     if (isMoving.current && gameTick.current % 20 === 0) {
       audio.playFootstep();
@@ -567,85 +905,93 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
         const totalMoveX = player.dirX * forwardAmount + player.planeX * strafeAmount;
         const totalMoveY = player.dirY * forwardAmount + player.planeY * strafeAmount;
 
-        if (worldMap[Math.floor(player.posX + totalMoveX)][Math.floor(player.posY)] === 0) {
+        if (worldMap[Math.floor(player.posY)][Math.floor(player.posX + totalMoveX)] === 0) {
           player.posX += totalMoveX;
         }
-        if (worldMap[Math.floor(player.posX)][Math.floor(player.posY + totalMoveY)] === 0) {
+        if (worldMap[Math.floor(player.posY + totalMoveY)][Math.floor(player.posX)] === 0) {
           player.posY += totalMoveY;
         }
       }
     }
     
     // Weapon Switching
-    if (keys['1'] && player.weapon !== 'gun') {
-      player.weapon = 'gun';
-      audio.playWeaponSwitch();
+    if (keys['1']) {
+      handleWeaponSwitch('gun');
     }
-    if (keys['q'] && player.weapon !== 'knife') {
-      player.weapon = 'knife';
-      audio.playWeaponSwitch();
+    if (keys['q']) {
+      handleWeaponSwitch('knife');
     }
 
     // Attack logic
-    const wantsToAttack = keys[' '] || shootTouchId.current !== null;
+    const wantsToAttack = (keys[' '] || shootTouchId.current !== null) && !isSwitchingWeapon.current;
     if (wantsToAttack) {
-      if (player.weapon === 'gun' && shootCooldown.current === 0 && player.ammo > 0 && !isReloading.current) {
-        player.ammo--;
-        shootCooldown.current = FIRE_RATE;
-        shootAnimTimer.current = 3; 
-        audio.playGunshot();
+      if (player.weapon === 'gun' && !isReloading.current) {
+        if (player.ammo > 0 && shootCooldown.current === 0) {
+            player.ammo--;
+            shootCooldown.current = FIRE_RATE;
+            shootAnimTimer.current = 3; 
+            recoilOffset.current = 10;
+            audio.playGunshot();
 
-        // Gun hit detection
-        let closestSprite = -1;
-        let minSpriteDist = Infinity;
-        
-        spritesRef.current.forEach((sprite, index) => {
-            if (sprite.state === 'dying' || sprite.state === 'dead') return;
-
-            const spriteX = sprite.x - player.posX;
-            const spriteY = sprite.y - player.posY;
-            const invDet = 1.0 / (player.planeX * player.dirY - player.dirX * player.planeY);
-            const transformY = invDet * (-player.planeY * spriteX + player.planeX * spriteY);
+            // Gun hit detection
+            let closestSprite = -1;
+            let minSpriteDist = Infinity;
             
-            if(transformY > 0){
-                const transformX = invDet * (player.dirY * spriteX - player.dirX * spriteY);
-                const spriteScreenX = Math.floor((SCREEN_WIDTH / 2) * (1 + transformX / transformY));
-                const distToCenter = Math.abs(spriteScreenX - SCREEN_WIDTH / 2);
+            spritesRef.current.forEach((sprite, index) => {
+                if (sprite.type !== 'enemy' || sprite.state === 'dying' || sprite.state === 'dead') return;
+
+                const spriteX = sprite.x - player.posX;
+                const spriteY = sprite.y - player.posY;
+                const invDet = 1.0 / (player.planeX * player.dirY - player.dirX * player.planeY);
+                const transformY = invDet * (-player.planeY * spriteX + player.planeX * spriteY);
                 
-                if (distToCenter < minSpriteDist && transformY < zBuffer.current[SCREEN_WIDTH/2]) {
-                    minSpriteDist = distToCenter;
-                    closestSprite = index;
+                if(transformY > 0){
+                    const transformX = invDet * (player.dirY * spriteX - player.dirX * spriteY);
+                    const spriteScreenX = Math.floor((SCREEN_WIDTH / 2) * (1 + transformX / transformY));
+                    const spriteWidth = Math.abs(Math.floor(SCREEN_HEIGHT / transformY));
+                    const distToCenter = Math.abs(spriteScreenX - SCREEN_WIDTH / 2);
+                    
+                    if (distToCenter < spriteWidth / 2 && transformY < minSpriteDist) {
+                        minSpriteDist = transformY;
+                        closestSprite = index;
+                    }
+                }
+            });
+
+            if (closestSprite !== -1) {
+                const target = spritesRef.current[closestSprite];
+                target.health! -= GUN_DAMAGE;
+                if(target.health! <= 0) {
+                    target.state = 'dying';
+                    target.deathTimer = ENEMY_DEATH_ANIM_DURATION;
+                    player.score += SCORE_PER_KILL;
+                    onScoreChange(player.score);
+                    audio.playEnemyDeath();
+                } else {
+                    audio.playEnemyHit();
                 }
             }
-        });
-
-        if (closestSprite !== -1 && minSpriteDist < 50) { // 50 is arbitrary hit width
-            const target = spritesRef.current[closestSprite];
-            target.health -= GUN_DAMAGE;
-            if(target.health <= 0) {
-                target.state = 'dying';
-                target.deathTimer = ENEMY_DEATH_ANIM_DURATION;
-                player.score += SCORE_PER_KILL;
-                onScoreChange(player.score);
-                audio.playEnemyDeath();
-            } else {
-                audio.playEnemyHit();
-            }
+        } else if (player.ammo <= 0 && emptyClickCooldown.current === 0) {
+            // Dry fire animation and sound
+            emptyClickCooldown.current = FIRE_RATE;
+            audio.playEmptyClick();
+            emptyGunAnimTimer.current = 10;
+            ammoFlashTimer.current = 30;
         }
 
       } else if (player.weapon === 'knife' && slashCooldown.current === 0) {
         slashCooldown.current = MELEE_RATE;
-        slashAnimTimer.current = 5; 
+        slashAnimTimer.current = MELEE_RATE / 4; 
         audio.playKnifeSlash();
         
         const killedSprites: Sprite[] = [];
         const hitSprites: Sprite[] = [];
 
         spritesRef.current.forEach(sprite => {
-            if (sprite.state === 'dying' || sprite.state === 'dead') return;
+            if (sprite.type !== 'enemy' || sprite.state === 'dying' || sprite.state === 'dead') return;
             const dist = Math.sqrt((player.posX - sprite.x)**2 + (player.posY - sprite.y)**2);
             if (dist < KNIFE_RANGE) {
-                if (sprite.health - KNIFE_DAMAGE <= 0) {
+                if (sprite.health! - KNIFE_DAMAGE <= 0) {
                     killedSprites.push(sprite);
                 } else {
                     hitSprites.push(sprite);
@@ -657,7 +1003,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
             let scoreGained = 0;
             killedSprites.forEach(sprite => {
                 if (sprite.state !== 'dying' && sprite.state !== 'dead') {
-                    sprite.health -= KNIFE_DAMAGE;
+                    sprite.health! -= KNIFE_DAMAGE;
                     sprite.state = 'dying';
                     sprite.deathTimer = ENEMY_DEATH_ANIM_DURATION;
                     scoreGained += SCORE_PER_KILL;
@@ -670,7 +1016,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
             audio.playEnemyDeath();
         } else if (hitSprites.length > 0) {
             hitSprites.forEach(sprite => {
-                sprite.health -= KNIFE_DAMAGE;
+                sprite.health! -= KNIFE_DAMAGE;
             });
             audio.playEnemyHit();
         }
@@ -695,29 +1041,45 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
       player.planeY = oldPlaneX * Math.sin(ROTATION_SPEED) + player.planeY * Math.cos(ROTATION_SPEED);
     }
 
-     // Touch Rotation
-    if (rightTouchId.current !== null && lookDeltaX.current !== 0) {
-      const rotation = lookDeltaX.current * TOUCH_LOOK_SENSITIVITY;
-      const oldDirX = player.dirX;
-      player.dirX = player.dirX * Math.cos(-rotation) - player.dirY * Math.sin(-rotation);
-      player.dirY = oldDirX * Math.sin(-rotation) + player.dirY * Math.cos(-rotation);
-      const oldPlaneX = player.planeX;
-      player.planeX = player.planeX * Math.cos(-rotation) - player.planeY * Math.sin(-rotation);
-      player.planeY = oldPlaneX * Math.sin(-rotation) + player.planeY * Math.cos(-rotation);
-      lookDeltaX.current = 0;
+    // Touch Rotation
+    const lookDamping = 0.75; // A value between 0-1. Higher means less friction.
+    if (rightTouchId.current !== null || Math.abs(lookDeltaX.current) > 0.1) {
+        const rotation = lookDeltaX.current * TOUCH_LOOK_SENSITIVITY;
+        const oldDirX = player.dirX;
+        player.dirX = player.dirX * Math.cos(-rotation) - player.dirY * Math.sin(-rotation);
+        player.dirY = oldDirX * Math.sin(-rotation) + player.dirY * Math.cos(-rotation);
+        const oldPlaneX = player.planeX;
+        player.planeX = player.planeX * Math.cos(-rotation) - player.planeY * Math.sin(-rotation);
+        player.planeY = oldPlaneX * Math.sin(-rotation) + player.planeY * Math.cos(-rotation);
+
+        if (rightTouchId.current !== null) {
+            // While touching, we reset the delta each frame so it only contains the latest movement
+            lookDeltaX.current = 0;
+        } else {
+            // After letting go, we apply damping to the last movement for a smooth stop
+            lookDeltaX.current *= lookDamping;
+        }
     }
-  }, [onScoreChange]);
+  }, [onScoreChange, handleWeaponSwitch]);
 
   const gameLoop = useCallback(() => {
-    updatePlayerState();
-    updateSprites();
+    if (playerStateRef.current === 'dead') {
+      playerRespawnTimer.current--;
+      if (playerRespawnTimer.current <= 0) {
+        respawnPlayer();
+      }
+    } else {
+      updatePlayerState();
+      updateSprites();
+    }
     renderGame();
-  }, [renderGame, updatePlayerState, updateSprites]);
+  }, [renderGame, updatePlayerState, updateSprites, respawnPlayer]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!hasInteracted.current) {
         audio.resumeAudioContext();
+        audio.startBackgroundMusic();
         hasInteracted.current = true;
       }
       keysPressed.current[e.key.toLowerCase()] = true;
@@ -736,8 +1098,11 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
       e.preventDefault();
       if (!hasInteracted.current) {
         audio.resumeAudioContext();
+        audio.startBackgroundMusic();
         hasInteracted.current = true;
       }
+      if (playerStateRef.current === 'dead') return;
+
       const rect = canvas.getBoundingClientRect();
       for (const touch of Array.from(e.changedTouches)) {
         const touchX = (touch.clientX - rect.left) / rect.width * SCREEN_WIDTH;
@@ -754,8 +1119,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
           // Check for weapon switch button tap (top-right)
           if (touchX > WEAPON_SWITCH_BUTTON_X && touchX < WEAPON_SWITCH_BUTTON_X + WEAPON_SWITCH_BUTTON_WIDTH &&
               touchY > WEAPON_SWITCH_BUTTON_Y && touchY < WEAPON_SWITCH_BUTTON_Y + WEAPON_SWITCH_BUTTON_HEIGHT) {
-                playerRef.current.weapon = playerRef.current.weapon === 'gun' ? 'knife' : 'gun';
-                audio.playWeaponSwitch();
+                handleWeaponSwitch(playerRef.current.weapon === 'gun' ? 'knife' : 'gun');
                 continue; 
           }
           
@@ -763,7 +1127,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
           if (playerRef.current.weapon === 'gun') {
             const reloadDist = Math.sqrt((touchX - RELOAD_BUTTON_X)**2 + (touchY - RELOAD_BUTTON_Y)**2);
             if (reloadDist < RELOAD_BUTTON_RADIUS) {
-              if (playerRef.current.ammo < playerRef.current.maxAmmo && !isReloading.current) {
+              if (playerRef.current.ammo < playerRef.current.maxAmmo && !isReloading.current && !isSwitchingWeapon.current) {
                 isReloading.current = true;
                 reloadTimer.current = RELOAD_TIME;
                 audio.playReload();
@@ -791,6 +1155,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
 
     const handleTouchMove = (e: TouchEvent) => {
       e.preventDefault();
+      if (playerStateRef.current === 'dead') return;
+
       const rect = canvas.getBoundingClientRect();
       for (const touch of Array.from(e.changedTouches)) {
         const touchX = (touch.clientX - rect.left) / rect.width * SCREEN_WIDTH;
@@ -836,7 +1202,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
     canvas.addEventListener('touchend', handleTouchEnd);
     canvas.addEventListener('touchcancel', handleTouchEnd);
 
-    gameLoopRef.current = window.setInterval(gameLoop, 1000 / 60);
+    if (!isPaused) {
+        gameLoopRef.current = window.setInterval(gameLoop, 1000 / 60);
+    }
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
@@ -847,9 +1215,10 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreChange }) => {
       canvas.removeEventListener('touchcancel', handleTouchEnd);
       if (gameLoopRef.current) {
         clearInterval(gameLoopRef.current);
+        gameLoopRef.current = null;
       }
     };
-  }, [gameLoop]);
+  }, [gameLoop, isPaused, handleWeaponSwitch, respawnPlayer]);
 
   return (
     <canvas

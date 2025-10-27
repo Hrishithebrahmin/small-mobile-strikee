@@ -1,3 +1,4 @@
+
 export interface Player {
   posX: number;
   posY: number;
@@ -9,18 +10,24 @@ export interface Player {
   maxAmmo: number;
   score: number;
   weapon: 'gun' | 'knife';
+  health: number;
+  maxHealth: number;
+  isImmune: boolean;
+  immunityTimer: number;
 }
 
 export interface Sprite {
+  type: 'enemy' | 'medkit';
   x: number;
   y: number;
   initialX: number;
   initialY: number;
-  health: number;
+  health?: number;
   state: 'idle' | 'chasing' | 'dying' | 'dead';
-  deathTimer: number;
+  deathTimer?: number;
   respawnTimer: number;
-  name: string;
+  name?: string;
+  attackCooldown?: number;
 }
 
 export interface LeaderboardEntry {
